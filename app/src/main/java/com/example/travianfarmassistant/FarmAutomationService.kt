@@ -580,6 +580,20 @@ class FarmAutomationService : Service() {
     private fun triggerScheduledCycle() {
         debugTrace("ENTER triggerScheduledCycle")
         if (!running) return
+
+        // Jangan membuat cycle baru selama AUTO REFRESH VILLAGE masih berjalan.
+        // Sebelumnya fungsi ini sudah menaikkan cycleNumber dan menulis CICLE START
+        // sebelum melakukan pengecekan refresh. Retry 1 detik kemudian akhirnya
+        // membuat beberapa cycle tumpang tindih dan Farm List/Builder menjadi tidak
+        // tertib.
+        if (!villageRefreshClosed || villageRefreshInProgress || !villageRefreshCompleted) {
+            countdownCyclePending = true
+            logEvent("Siklus: menunggu AUTO REFRESH VILLAGE selesai; cycle belum dimulai")
+            handler.removeCallbacks(cycleStartRetryRunnable)
+            handler.postDelayed(cycleStartRetryRunnable, 1_000L)
+            return
+        }
+
         countdownCyclePending = false
         scheduledRefreshForNextRun = false
         val now = timeFormat.format(Date())
@@ -587,8 +601,12 @@ class FarmAutomationService : Service() {
         farmListCycleStartedAt = if (farmListEnabled) System.currentTimeMillis() else 0L
         resourceBuilderCycleStartedAt = 0L
         farmListCycleComplete = !farmListEnabled
-        // Refresh Village adalah persiapan cycle berikutnya. Jika belum selesai
-        // saat Next Run tiba, cycle menunggu sampai Refresh Village ditutup.
+
+        // Selalu ambil ulang checklist terbaru tepat sebelum cycle dimulai.
+        refreshBuilderSelectionFromPrefs()
+        val selectedCount = loadVillageDataRecordsFromPrefs().count { it.isChecklist }
+        logEvent("CICLE START #$cycleNumber — checklist terbaru: $selectedCount village")
+
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putString("last_run", now)
             .putInt("current_cycle_number", cycleNumber)
@@ -596,17 +614,13 @@ class FarmAutomationService : Service() {
             .putLong("farm_cycle_started_at", farmListCycleStartedAt)
             .putLong("resource_cycle_started_at", 0L)
             .apply()
-        logEvent("CICLE START")
         handler.removeCallbacks(cycleWatchdogRunnable)
-        // Refresh Village berjalan pada fase countdown. Jangan membatalkan timer-nya;
-        // bila Next Run tiba lebih dulu, cycle akan menunggu refresh selesai.
         handler.postDelayed(cycleWatchdogRunnable, 15 * 60_000L)
-        if (!villageRefreshClosed || villageRefreshInProgress || !villageRefreshCompleted) {
-            logEvent("Siklus: menunggu AUTO REFRESH VILLAGE ditutup sebelum Farm List/Resource Builder")
-            handler.postDelayed({ if (running) triggerScheduledCycle() }, 1_000L)
-            return
-        }
         triggerScheduledCycleActions()
+    }
+
+    private val cycleStartRetryRunnable = Runnable {
+        if (running) triggerScheduledCycle()
     }
 
     private fun triggerScheduledCycleActions() {
