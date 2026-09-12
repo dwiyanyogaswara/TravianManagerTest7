@@ -2823,7 +2823,6 @@ private fun clickTransferSelected() {
         val line = "${logTimeFormat.format(Date())} | $clean"
         try {
             openFileOutput(logFileName, MODE_APPEND).bufferedWriter().use { it.appendLine(line) }
-            scheduleRecentLogRefresh()
         } catch (_: Exception) {
             // Logging must never interrupt the automation.
         }
