@@ -330,7 +330,7 @@ class MainActivity : Activity() {
 
         val prefs = getSharedPreferences("config", MODE_PRIVATE)
         restoreResourceSnapshots(prefs)
-        logEvent("Aplikasi v4.14.10 dimulai")
+        logEvent("Aplikasi v4.14.15 dimulai")
         val savedCredential = CredentialDatabase(this).read()
         serverInput.setText(savedCredential?.server ?: "https://ts20.x2.europe.travian.com")
         usernameInput.setText(savedCredential?.username ?: "")
@@ -501,6 +501,7 @@ class MainActivity : Activity() {
                 botToggle.setOnCheckedChangeListener(this@MainActivity::handleBotToggle)
             }
         } else {
+            logEvent("BOT OFF")
             stopScheduler()
         }
     }
@@ -586,6 +587,7 @@ class MainActivity : Activity() {
         } else {
             startService(intent)
         }
+        logEvent("BOT ON")
         return true
     }
 
@@ -855,10 +857,10 @@ class MainActivity : Activity() {
 
         val lines = mutableListOf<String>()
         lines += "DATABASE VILLAGE (${records.size})"
-        lines += "CHK | NAMA | ID | LINK VILLAGE | LINK RESOURCE | MIN LVL"
-        lines += "----+------+----+--------------+---------------+-------"
+        lines += "CHK | NAMA | ID | LINK VILLAGE | LINK RESOURCE | RES ID | GID | MIN LVL"
+        lines += "----+------+----+--------------+---------------+--------+-----+-------"
         records.forEach { item ->
-            lines += "${if (item.isChecklist) "✓" else "-"} | ${item.namaVillage} | ${item.id} | ${item.linkVillage.ifBlank { "-" }} | ${item.linkResource.ifBlank { "-" }} | ${if (item.minLvl >= 0) "L${item.minLvl}" else "-"}"
+            lines += "${if (item.isChecklist) "✓" else "-"} | ${item.namaVillage} | ${item.id} | ${item.linkVillage.ifBlank { "-" }} | ${item.linkResource.ifBlank { "-" }} | ${item.resourceId.ifBlank { "-" }} | ${item.resourceGid.ifBlank { "-" }} | ${if (item.minLvl >= 0) "L${item.minLvl}" else "-"}"
         }
         villageDatabaseView.text = lines.joinToString("\n")
         villageDatabaseView.setTextIsSelectable(true)
@@ -1121,7 +1123,7 @@ class MainActivity : Activity() {
         clearSavedResourceBuilderTargets()
 
         farmStatus.text = "Refresh village: membaca daftar village..."
-        logEvent("UI: REFRESH VILLAGE → membuka dorf1.php")
+        logEvent("REFRESH VILLAGE START")
         val server = normalizeServer(serverInput.text.toString())
         webView.loadUrl("$server/dorf1.php")
     }
@@ -1509,84 +1511,162 @@ class MainActivity : Activity() {
                     return;
                 }
 
-                // RESOURCE FIELDS: jangan bergantung pada satu class. Travian dapat
-                // menaruh level pada class level10, data-level, title, aria-label,
-                // atau elemen anak dari field. Karena container khusus resource field,
-                // kita scan seluruh turunannya dan deduplicate level yang ditemukan.
+                // RESOURCE FIELDS:
+                // Jangan menentukan field terendah dari kumpulan "level" yang ditemukan
+                // secara terpisah. Level harus selalu diikat ke FIELD yang sama dengan
+                // ID dan GID-nya. Jika tidak, level dari field A bisa salah dipasangkan
+                // dengan ID/GID field B.
                 const container = document.querySelector('#resourceFieldContainer');
-                const fields = [];
                 const debugFields = [];
-                const fieldNodes = container ? [...container.querySelectorAll('*')] : [];
-                for (const node of fieldNodes) {
-                    const candidates = [
-                        node.getAttribute?.('data-level') || '',
-                        node.getAttribute?.('title') || '',
-                        node.getAttribute?.('aria-label') || '',
-                        String(node.className || ''),
-                        clean(node.textContent || '')
-                    ];
-                    let level = -1;
-                    for (const text of candidates) {
-                        const m = String(text).match(/(?:^|[\s_-])level\s*(\d+)\b/i) ||
-                                  String(text).match(/\blevel(\d+)\b/i);
-                        if (m) { level = parseInt(m[1],10); break; }
-                    }
-                    if (level >= 0) {
-                        fields.push(level);
-                        if (debugFields.length < 30) {
-                            debugFields.push({level, tag:node.tagName || '', className:String(node.className || '').slice(0,140), text:clean(node.textContent || '').slice(0,60)});
-                        }
-                    }
-                }
-                const levels = fields.filter(n => Number.isFinite(n));
-                const uniqueLevels = levels.slice(0, 18);
-
-                // Simpan LINK field dengan level terendah. Ini menjadi target yang
-                // dipakai Resource Builder saat eksekusi berikutnya. Link diambil
-                // langsung dari anchor field agar id/link tetap spesifik ke village.
-                const resourceAnchors = container
-                    ? [...container.querySelectorAll('a[href*="build.php?id="]')]
-                    : [];
                 const resourceCandidates = [];
                 const seenResourceIds = new Set();
-                for (const a of resourceAnchors) {
-                    const hrefRaw = a.getAttribute('href') || '';
-                    const m = hrefRaw.match(/[?&]id=(\d+)/i);
-                    if (!m || seenResourceIds.has(m[1])) continue;
-                    const fieldId = parseInt(m[1], 10);
-                    if (!Number.isFinite(fieldId) || fieldId < 1 || fieldId > 18) continue;
-                    seenResourceIds.add(m[1]);
-                    let level = -1;
-                    let node = a;
-                    for (let depth = 0; depth < 10 && node; depth++, node = node.parentElement) {
-                        const text = clean(node.innerText || node.textContent || '');
-                        const attrs = [
-                            node.getAttribute?.('data-level') || '',
+
+                const attr = (el, names) => {
+                    for (const name of names) {
+                        const value = el?.getAttribute?.(name);
+                        if (value != null && String(value).trim() !== '') return String(value).trim();
+                    }
+                    return '';
+                };
+
+                const numberFrom = (value, patterns) => {
+                    const text = String(value || '');
+                    for (const pattern of patterns) {
+                        const m = text.match(pattern);
+                        if (m) return parseInt(m[1], 10);
+                    }
+                    return -1;
+                };
+
+                const readFieldValue = (anchor, names, patterns, maxDepth = 10) => {
+                    let node = anchor;
+                    for (let depth = 0; depth < maxDepth && node; depth++, node = node.parentElement) {
+                        const className = typeof node.className === 'string' ? node.className : '';
+                        const values = [
+                            ...names.map(name => node.getAttribute?.(name) || ''),
                             node.getAttribute?.('title') || '',
                             node.getAttribute?.('aria-label') || '',
-                            String(node.className || '')
-                        ].join(' ');
-                        const lm = text.match(/(?:level|lvl)\s*(\d+)/i) || attrs.match(/level\s*(\d+)/i) || String(node.className || '').match(/level(\d+)\b/i);
-                        if (lm) { level = parseInt(lm[1], 10); break; }
+                            className
+                        ];
+                        const value = numberFrom(values.join(' '), patterns);
+                        if (value >= 0) return value;
                     }
-                    const disabled = a.classList.contains('disabled') || !!a.closest('.disabled') ||
-                        a.getAttribute('aria-disabled') === 'true' || a.getAttribute('data-disabled') === 'true';
-                    const absoluteHref = new URL(hrefRaw, location.href);
-                    // Bind target ke village yang SEDANG diverifikasi.
-                    // build.php?id=4&gid=1 saja ambigu saat dipakai kembali;
-                    // newdid memastikan field L terendah tetap milik village ini.
-                    const fieldGid = absoluteHref.searchParams.get('gid') || '1';
-                    absoluteHref.searchParams.set('gid', fieldGid);
-                    absoluteHref.searchParams.set('newdid', expectedId);
-                    resourceCandidates.push({fieldId, gid:fieldGid, level, href:absoluteHref.href, disabled});
-                }
-                resourceCandidates.sort((a,b) => {
-                    const al = a.level >= 0 ? a.level : 999;
-                    const bl = b.level >= 0 ? b.level : 999;
-                    return al - bl || a.fieldId - b.fieldId;
-                });
-                const lowestResource = resourceCandidates.find(x => !x.disabled && x.level >= 0 && x.level < 10) || null;
+                    return -1;
+                };
 
+                // Ambil anchor field dari container. Fallback ke seluruh elemen yang
+                // terlihat seperti slot field bila tema Travian tidak memakai href standar.
+                const fieldAnchors = container
+                    ? [...container.querySelectorAll('a[href*="build.php?id="], a[data-id], a[id], .buildingSlot a, .resourceField a')]
+                    : [];
+
+                for (const a of fieldAnchors) {
+                    const hrefRaw = a.getAttribute('href') || '';
+                    const absoluteHref = (() => {
+                        try { return new URL(hrefRaw, location.href); } catch (_) { return null; }
+                    })();
+
+                    // ID field: prioritas query id=, lalu data-id/id/class pada anchor/ancestor.
+                    let fieldId = absoluteHref?.searchParams.get('id') ?
+                        parseInt(absoluteHref.searchParams.get('id'), 10) : -1;
+                    if (!(fieldId >= 1 && fieldId <= 18)) {
+                        fieldId = readFieldValue(
+                            a,
+                            ['data-id', 'data-field-id', 'data-fieldid'],
+                            [
+                                /(?:^|[\s_-])id\s*([0-9]{1,2})(?=$|[\s_-])/i,
+                                /(?:^|[\s_-])field(?:id)?\s*([0-9]{1,2})(?=$|[\s_-])/i
+                            ]
+                        );
+                    }
+                    if (!(fieldId >= 1 && fieldId <= 18)) continue;
+
+                    // GID HARUS berasal dari field yang sama. Jangan pernah default ke gid=1.
+                    let gid = absoluteHref?.searchParams.get('gid') ?
+                        parseInt(absoluteHref.searchParams.get('gid'), 10) : -1;
+                    if (!(gid >= 1 && gid <= 4)) {
+                        gid = readFieldValue(
+                            a,
+                            ['data-gid', 'data-building-gid', 'data-buildingid', 'data-building-id'],
+                            [
+                                /(?:^|[\s_-])gid\s*([1-4])(?=$|[\s_-])/i,
+                                /(?:^|[\s_-])building(?:id|gid)?\s*([1-4])(?=$|[\s_-])/i
+                            ]
+                        );
+                    }
+                    if (!(gid >= 1 && gid <= 4)) continue;
+
+                    // Level juga dibaca dari wrapper field yang sama, bukan dari seluruh
+                    // #resourceFieldContainer. Dukung data-level, class levelN/lvlN,
+                    // title/aria-label, termasuk variasi class Travian seperti alevelN.
+                    const level = readFieldValue(
+                        a,
+                        ['data-level', 'data-lvl', 'data-field-level'],
+                        [
+                            /(?:^|[\s_-])(?:a)?level\s*([0-9]{1,2})(?=$|[\s_-])/i,
+                            /(?:^|[\s_-])lvl\s*([0-9]{1,2})(?=$|[\s_-])/i,
+                            /(?:^|[\s_-])level([0-9]{1,2})(?=$|[\s_-])/i,
+                            /(?:^|[\s_-])lvl([0-9]{1,2})(?=$|[\s_-])/i
+                        ]
+                    );
+                    if (!(level >= 0)) continue;
+
+                    const disabled = a.classList.contains('disabled') || !!a.closest('.disabled') ||
+                        a.getAttribute('aria-disabled') === 'true' ||
+                        a.getAttribute('data-disabled') === 'true';
+
+                    // Jika ada duplicate anchor untuk field yang sama, pilih record yang
+                    // paling lengkap; jangan biarkan duplicate mengubah hasil min level.
+                    if (seenResourceIds.has(fieldId)) continue;
+                    seenResourceIds.add(fieldId);
+
+                    if (absoluteHref) {
+                        absoluteHref.searchParams.set('gid', String(gid));
+                        absoluteHref.searchParams.set('newdid', expectedId);
+                    }
+
+                    resourceCandidates.push({
+                        fieldId,
+                        gid,
+                        level,
+                        href: absoluteHref?.href || hrefRaw,
+                        disabled
+                    });
+
+                    if (debugFields.length < 30) {
+                        const owner = (() => {
+                            let n = a;
+                            for (let depth = 0; depth < 8 && n; depth++, n = n.parentElement) {
+                                const cls = typeof n.className === 'string' ? n.className : '';
+                                if (cls.includes('buildingSlot') || cls.includes('resourceField') ||
+                                    n.hasAttribute?.('data-level') || n.hasAttribute?.('data-gid')) return n;
+                            }
+                            return a.parentElement || a;
+                        })();
+                        debugFields.push({
+                            fieldId,
+                            gid,
+                            level,
+                            tag: owner?.tagName || a.tagName || '',
+                            className: String(owner?.className || a.className || '').slice(0,140),
+                            href: absoluteHref?.href || hrefRaw,
+                            text: clean(owner?.textContent || a.textContent || '').slice(0,80)
+                        });
+                    }
+                }
+
+                // Hanya field dengan ID + GID + level yang lengkap yang boleh menjadi target.
+                // Urutan tie-break tetap fieldId agar hasil deterministik.
+                resourceCandidates.sort((a,b) => a.level - b.level || a.fieldId - b.fieldId);
+                const lowestResource = resourceCandidates.find(
+                    x => !x.disabled && x.level >= 0 && x.gid >= 1 && x.gid <= 4 && x.level < 10
+                ) || null;
+
+                // Semua 18 field harus benar-benar teridentifikasi sebagai pasangan
+                // {fieldId,gid,level}; jumlah node DOM saja tidak cukup.
+                const uniqueFields = resourceCandidates.length;
+                const resourceFieldsComplete = uniqueFields >= 18;
+                const uniqueLevels = resourceCandidates.map(x => x.level);
                 // RESOURCE BAR: Travian Legends memakai l1=wood, l2=clay,
                 // l3=iron, l4=crop. Sumber paling stabil adalah object window.resources
                 // yang dipakai UI Travian sendiri; fallback membaca #stockBar.
@@ -1649,7 +1729,7 @@ class MainActivity : Activity() {
                 // Level village dan snapshot resource dipisahkan: jangan membuang village
                 // hanya karena resource bar terlambat dirender. Nama + level tetap diterima
                 // jika 18 field sudah tersedia; resource akan disimpan bila lengkap.
-                if (!container || uniqueLevels.length < 18) {
+                if (!container || !resourceFieldsComplete) {
                     AndroidFarm.onVillageScanResult(JSON.stringify({
                         notReady:true, reason:'FIELDS_NOT_READY', id:currentId, expectedId,
                         url, activeId, activeName, fieldCount:uniqueLevels.length,
@@ -1668,7 +1748,7 @@ class MainActivity : Activity() {
 
                 AndroidFarm.onVillageScanResult(JSON.stringify({
                     id:expectedId, name:pageName, minLevel:(lowestResource?.level ?? Math.min(...uniqueLevels)),
-                    fields:uniqueLevels, fieldNodeCount:fieldNodes.length,
+                    fields:uniqueLevels, fieldNodeCount:uniqueFields, resourceFieldCount:uniqueFields,
                     debugFieldCount:debugFields.length, debugFields,
                     resourceContainer:true, activeId, activeName, url, resources, lowestResource
                 }));
@@ -1760,8 +1840,9 @@ class MainActivity : Activity() {
                 minLvl = minLevel,
                 isChecklist = existingRecord?.isChecklist
             )
+            if (minLevel >= 0) logEvent("Village $name Updated min L$minLevel")
 
-                villageMinLevels[id] = minLevel
+            villageMinLevels[id] = minLevel
             }
 
         val progress = "${villageScanIndex + 1}/${villageScanTargets.size}"
@@ -1820,6 +1901,13 @@ class MainActivity : Activity() {
         if (wood.first < 0 || clay.first < 0 || iron.first < 0 || crop.first < 0) {
             logEvent("UI: [$progress] resource belum lengkap — wood=$wood; clay=$clay; iron=$iron; crop=$crop")
         }
+        logEvent(
+            "UI: [$progress] TARGET RES TERENDAH — " +
+                "id=${lowestResourceId.ifBlank { "-" }}; " +
+                "gid=${lowestResourceGid.ifBlank { "-" }}; " +
+                "level=${if (lowestResourceLevel >= 0) "L$lowestResourceLevel" else "-"}; " +
+                "href=${lowestResourceHref.ifBlank { "-" }}"
+        )
         if (capacityTab.visibility == View.VISIBLE) renderCapacityOverview()
 
         val existing = villageScanResults.indexOfFirst { it.first == id }
@@ -1861,10 +1949,7 @@ class MainActivity : Activity() {
         }.distinctBy { it.first }
         val processedCount = villageScanResults.distinctBy { it.first }.size
         farmStatus.text = "${merged.size} village ditemukan; detail berhasil ${processedCount}/${merged.size}."
-        logEvent(
-            "UI: scan selesai — ${processedCount}/${merged.size} detail berhasil; " +
-                "${merged.size} village tetap ditampilkan"
-        )
+        logEvent("REFRESH VILLAGE END")
 
         renderVillageChecklist(merged)
 
@@ -2302,41 +2387,23 @@ class MainActivity : Activity() {
         return s.trimEnd('/')
     }
 
-    /** Verbose diagnostics: every function entry is sent to Logcat and, except high-frequency UI helpers, to the app log. */
+    /** Debug tracing dinonaktifkan untuk build produksi. */
     private fun debugTrace(message: String) {
-        android.util.Log.d("TravianFarmAssistant", "[DEBUG] $message")
-        val quiet = message.removePrefix("ENTER ").substringBefore("(")
-        // Helper UI/log ini dapat dipanggil dari logEvent(). Jangan persist debugTrace
-        // mereka, karena refreshLogOverview() -> debugTrace() -> logEvent() akan
-        // membuat rekursi tak berujung dan menyebabkan ANR saat tab Log dibuka.
-        if (quiet !in setOf(
-                "updateCountdown",
-                "run",
-                "refreshRecentLogs",
-                "pruneLogs",
-                "refreshLogOverview",
-                "buildColoredLog"
-            )) {
-            logEvent("[DEBUG] $message")
-        }
+        // Intentionally empty.
     }
 
     private fun logEvent(message: String) {
-        val line = "${logTimeFormat.format(Date())} | $message"
+        val clean = when {
+            message == "BOT ON" -> "BOT ON"
+            message == "BOT OFF" -> "BOT OFF"
+            message == "REFRESH VILLAGE START" -> "REFRESH VILLAGE START"
+            message == "REFRESH VILLAGE END" -> "REFRESH VILLAGE END"
+            message.startsWith("Village ") && message.contains(" Updated min L") -> message
+            else -> return
+        }
+        val line = "${logTimeFormat.format(Date())} | $clean"
         try {
             openFileOutput(logFileName, MODE_APPEND).bufferedWriter().use { it.appendLine(line) }
-
-            // Jangan prune/read seluruh file pada setiap log. Dengan verbose debug hal ini
-            // membuat UI macet dan tab LOG dapat ANR. Cleanup cukup berkala.
-            val now = System.currentTimeMillis()
-            if (now - lastLogPruneAt >= 60 * 60 * 1000L) {
-                lastLogPruneAt = now
-                handler.post { pruneLogs() }
-            }
-
-            // Jangan membaca file log synchronously untuk setiap baris debug.
-            // Dengan verbose logging, ini sebelumnya membuat main thread sibuk terus
-            // dan tab dapat terlihat seperti crash/ANR.
             scheduleRecentLogRefresh()
         } catch (_: Exception) {
             // Logging must never interrupt the automation.
@@ -2704,13 +2771,6 @@ class MainActivity : Activity() {
         // Visibility diubah dulu, lalu konten dirender setelah UI punya kesempatan
         // menggambar frame berikutnya. Pembacaan file Log sendiri dilakukan async.
         fun showTab(tab: View) {
-            android.util.Log.d("TravianFarmAssistant", "TAB -> ${when (tab) {
-                farmTab -> "FARM"
-                capacityTab -> "CAPACITY"
-                logTab -> "LOG"
-                else -> "UNKNOWN"
-            }}")
-
             farmTab.visibility = if (tab === farmTab) View.VISIBLE else View.GONE
             capacityTab.visibility = if (tab === capacityTab) View.VISIBLE else View.GONE
             logTab.visibility = if (tab === logTab) View.VISIBLE else View.GONE
