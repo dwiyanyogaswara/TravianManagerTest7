@@ -285,8 +285,23 @@ class FarmAutomationService : Service() {
             initialCyclePending = false
             countdownCyclePending = false
             handler.post { triggerScheduledCycle() }
-        } else if (running && nextAt > 0L && System.currentTimeMillis() >= nextAt) {
-            handler.post { triggerScheduledCycle() }
+        } else if (running && nextAt > 0L) {
+            // Pastikan callback Next Run tetap terpasang setelah AUTO REFRESH VILLAGE.
+            // Refresh memakai Handler yang sama dan pada kondisi tertentu callback
+            // countdown dapat hilang dari queue. Jangan menunggu sampai pengguna
+            // mematikan/menyalakan bot untuk memulihkan scheduler.
+            val remaining = nextAt - System.currentTimeMillis()
+            handler.removeCallbacks(nextRunRunnable)
+            if (remaining <= 0L) {
+                logEvent("Next Run: waktu sudah tiba — lanjut ke cycle")
+                handler.post { triggerScheduledCycle() }
+            } else {
+                handler.postDelayed(nextRunRunnable, remaining)
+                logEvent("Next Run: ${timeFormat.format(Date(nextAt))}")
+                updateNotification(
+                    "Next Run ${timeFormat.format(Date(nextAt))} | dalam ${formatDuration(remaining)}"
+                )
+            }
         }
     }
 
