@@ -221,6 +221,9 @@ class FarmAutomationService : Service() {
     private var villageRefreshInspectInFlight = false
     private var villageRefreshVillages = mutableListOf<Pair<String, String>>()
     private var farmListCycleComplete = false
+    // Mutex de fase: hanya satu pekerjaan boleh berjalan dalam satu waktu.
+    private var cyclePhase = "IDLE"
+    private var cycleStartQueued = false
 
     private val cycleWatchdogRunnable: Runnable = Runnable {
         if (!running) return@Runnable
@@ -581,58 +584,73 @@ class FarmAutomationService : Service() {
         debugTrace("ENTER triggerScheduledCycle")
         if (!running) return
 
-        // Jangan membuat cycle baru selama AUTO REFRESH VILLAGE masih berjalan.
-        // Sebelumnya fungsi ini sudah menaikkan cycleNumber dan menulis CICLE START
-        // sebelum melakukan pengecekan refresh. Retry 1 detik kemudian akhirnya
-        // membuat beberapa cycle tumpang tindih dan Farm List/Builder menjadi tidak
-        // tertib.
-        if (!villageRefreshClosed || villageRefreshInProgress || !villageRefreshCompleted) {
-            countdownCyclePending = true
-            logEvent("Siklus: menunggu AUTO REFRESH VILLAGE selesai; cycle belum dimulai")
-            handler.removeCallbacks(cycleStartRetryRunnable)
-            handler.postDelayed(cycleStartRetryRunnable, 1_000L)
+        // Jangan pernah membuat cycle paralel/duplikat. Cycle baru hanya boleh
+        // dibuat setelah cycle sebelumnya benar-benar masuk countdown.
+        if (cyclePhase != "IDLE" || cycleStartQueued ||
+            getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("cycle_active", false)) {
+            logEvent("CYCLE GUARD: trigger diabaikan — proses masih berjalan; phase=$cyclePhase")
             return
         }
 
-        countdownCyclePending = false
-        scheduledRefreshForNextRun = false
-        val now = timeFormat.format(Date())
+        if (!villageRefreshClosed || villageRefreshInProgress || !villageRefreshCompleted) {
+            if (!cycleStartQueued) {
+                cycleStartQueued = true
+                logEvent("CYCLE WAIT: menunggu AUTO REFRESH VILLAGE selesai sebelum membuat cycle")
+            }
+            handler.postDelayed({
+                cycleStartQueued = false
+                if (running) triggerScheduledCycle()
+            }, 1_000L)
+            return
+        }
+
+        // Ambil ulang checklist tepat sebelum cycle dimulai.
+        reloadLatestChecklistForCycle()
         cycleNumber += 1
+        cyclePhase = if (farmListEnabled) "FARM_LIST" else if (resourceBuilderEnabled) "RESOURCE_BUILDER" else "IDLE"
         farmListCycleStartedAt = if (farmListEnabled) System.currentTimeMillis() else 0L
         resourceBuilderCycleStartedAt = 0L
         farmListCycleComplete = !farmListEnabled
-
-        // Selalu ambil ulang checklist terbaru tepat sebelum cycle dimulai.
-        refreshBuilderSelectionFromPrefs()
-        val selectedCount = loadVillageDataRecordsFromPrefs().count { it.isChecklist }
-        logEvent("CICLE START #$cycleNumber — checklist terbaru: $selectedCount village")
-
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putString("last_run", now)
+            .putString("last_run", timeFormat.format(Date()))
             .putInt("current_cycle_number", cycleNumber)
             .putBoolean("cycle_active", true)
             .putLong("farm_cycle_started_at", farmListCycleStartedAt)
             .putLong("resource_cycle_started_at", 0L)
             .apply()
+        logEvent("CICLE START #$cycleNumber — checklist terbaru dimuat; selected=${selectedBuilderVillageIds.size}")
         handler.removeCallbacks(cycleWatchdogRunnable)
         handler.postDelayed(cycleWatchdogRunnable, 15 * 60_000L)
         triggerScheduledCycleActions()
     }
 
-    private val cycleStartRetryRunnable = Runnable {
-        if (running) triggerScheduledCycle()
+    private fun reloadLatestChecklistForCycle() {
+        debugTrace("ENTER reloadLatestChecklistForCycle")
+        val records = loadVillageDataRecordsFromPrefs()
+        selectedBuilderVillageIds = records.filter { it.isChecklist }.map { it.id }.toSet()
+        selectedBuilderVillagesJson = org.json.JSONArray(selectedBuilderVillageIds.toList()).toString()
+        builderSelectionConfigured = records.isNotEmpty()
+        farmListEnabled = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("farm_list_enabled", farmListEnabled)
+        resourceBuilderEnabled = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("resource_builder_enabled", resourceBuilderEnabled)
+        logEvent("CHECKLIST SNAPSHOT: total=${records.size}; dicentang=${selectedBuilderVillageIds.size}; farmList=$farmListEnabled; resourceBuilder=$resourceBuilderEnabled")
     }
 
     private fun triggerScheduledCycleActions() {
         if (!running) return
+        if (cyclePhase == "IDLE") {
+            logEvent("CYCLE GUARD: actions diabaikan — tidak ada cycle aktif")
+            return
+        }
         if (!villageRefreshCompleted) {
             logEvent("Siklus: menunggu REFRESH VILLAGE selesai")
             handler.postDelayed({ if (running) triggerScheduledCycleActions() }, 1_000L)
             return
         }
         if (farmListEnabled) {
+            cyclePhase = "FARM_LIST"
             triggerStartAllFarmLists()
         } else if (resourceBuilderEnabled) {
+            cyclePhase = "RESOURCE_BUILDER"
             logEvent("Farm List OFF — menunggu AUTO REFRESH VILLAGE sebelum Resource Builder")
             maybeStartResourceBuilderAfterRefresh()
         } else {
@@ -644,6 +662,10 @@ class FarmAutomationService : Service() {
     private fun triggerStartAllFarmLists() {
         debugTrace("ENTER triggerStartAllFarmLists")
         if (!running || !farmListEnabled) return
+        if (pendingStartAll || cyclePhase != "FARM_LIST") {
+            logEvent("CYCLE GUARD: Farm List diabaikan — proses lain sedang berjalan; phase=$cyclePhase pending=$pendingStartAll")
+            return
+        }
         pendingStartAll = true
         startAllAttempt = 0
         consentAttempt = 0
@@ -1174,6 +1196,7 @@ class FarmAutomationService : Service() {
                 fallbackFarmListMode = false
                 pendingStartAll = false
                 farmListCycleComplete = true
+                if (resourceBuilderEnabled) cyclePhase = "RESOURCE_BUILDER"
                 maybeStartResourceBuilderAfterRefresh()
             } else {
                 logEvent("Fallback Farm List menunggu dispatch ${raidVerificationAttempt}/6; raid=$current; busy=$busy")
@@ -1563,6 +1586,10 @@ class FarmAutomationService : Service() {
     private fun startResourceBuilderCycle() {
         debugTrace("ENTER startResourceBuilderCycle")
         if (!running) return
+        if (builderInProgress || cyclePhase != "RESOURCE_BUILDER") {
+            logEvent("CYCLE GUARD: Resource Builder diabaikan — proses lain sedang berjalan; phase=$cyclePhase builder=$builderInProgress")
+            return
+        }
         builderInProgress = true
         builderVillages.clear()
         builderVillageIndex = 0
@@ -2322,6 +2349,7 @@ private fun clickTransferSelected() {
     }
 
     private fun finishResourceBuilderCycle() {
+        cyclePhase = "IDLE"
         debugTrace("ENTER finishResourceBuilderCycle")
         val now = System.currentTimeMillis()
         if (resourceBuilderCycleStartedAt > 0L) {
@@ -2639,6 +2667,8 @@ private fun clickTransferSelected() {
         debugTrace("ENTER scheduleNextRandomRun")
         if (!running) return
         persistActiveCycleDuration()
+        cyclePhase = "IDLE"
+        cycleStartQueued = false
         handler.removeCallbacks(cycleWatchdogRunnable)
         val chosenMinutes = if (maxMinutes <= minMinutes) minMinutes
         else Random.nextLong(minMinutes, maxMinutes + 1)
@@ -2737,6 +2767,8 @@ private fun clickTransferSelected() {
         persistActiveCycleDuration()
         // Nonaktifkan bot = hentikan siklus yang sedang berjalan dan seluruh callback tertunda.
         running = false
+        cyclePhase = "IDLE"
+        cycleStartQueued = false
         builderInProgress = false
         farmListCycleComplete = false
         countdownCyclePending = false

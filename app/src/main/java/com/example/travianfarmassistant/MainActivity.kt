@@ -330,7 +330,7 @@ class MainActivity : Activity() {
 
         val prefs = getSharedPreferences("config", MODE_PRIVATE)
         restoreResourceSnapshots(prefs)
-        logEvent("Aplikasi v4.14.15 dimulai")
+        logEvent("Aplikasi v4.14.16 dimulai")
         val savedCredential = CredentialDatabase(this).read()
         serverInput.setText(savedCredential?.server ?: "https://ts20.x2.europe.travian.com")
         usernameInput.setText(savedCredential?.username ?: "")
@@ -651,6 +651,9 @@ class MainActivity : Activity() {
                     .remove("resource_cycle_started_at")
                     .remove("farm_cycle_duration_ms")
                     .remove("resource_cycle_duration_ms")
+                    .remove("countdown_started_at")
+                    .remove("farm_list_enabled")
+                    .remove("resource_builder_enabled")
                     .apply()
 
                 loadedVillages.clear()
@@ -2301,6 +2304,15 @@ class MainActivity : Activity() {
             action = FarmAutomationService.ACTION_STOP
         }
         startService(intent)
+        // Pastikan instance service benar-benar dihentikan, termasuk callback
+        // tertunda dan WebView background yang mungkin masih hidup.
+        stopService(android.content.Intent(this, FarmAutomationService::class.java))
+        runCatching {
+            webView.stopLoading()
+            webView.clearHistory()
+            webView.clearCache(true)
+            webView.clearFormData()
+        }
         updateBotToggleVisual(false)
         status.text = "Status: STOPPED"
         logEvent("Status STOPPED")
