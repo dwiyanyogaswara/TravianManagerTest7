@@ -247,6 +247,7 @@ class MainActivity : Activity() {
     // Link village disimpan saat discovery agar Builder dapat mengikuti link village yang sama.
     private val villageScanCollectedLinks = linkedMapOf<String, String>()
     private var villageScanCollectInFlight = false
+    private var villageScanCommitReady = false
 
     private val handler = Handler(Looper.getMainLooper())
     private var running = false
@@ -1122,6 +1123,7 @@ class MainActivity : Activity() {
         villageScanCollectedTargets.clear()
         villageScanCollectedLinks.clear()
         villageScanCollectInFlight = false
+        villageScanCommitReady = false
         resetVillageResourceDataForRefresh()
         clearSavedResourceBuilderTargets()
 
@@ -1138,6 +1140,11 @@ class MainActivity : Activity() {
         val js = """
             (() => {
                 const clean = s => String(s || '').replace(/\s+/g,' ').trim();
+                const invalidNames = new Set(['attack','defender','crop','village groups','villages','new village group']);
+                const validName = name => {
+                    const n = clean(name).toLowerCase().replace(/\s+/g,' ');
+                    return n.length > 0 && !invalidNames.has(n) && !/^(attack|defender|crop)(\s|[-:])/i.test(n);
+                };
                 const out = [];
                 const seen = new Set();
                 const root = document.querySelector('#sidebarBoxVillagelist');
@@ -1190,6 +1197,7 @@ class MainActivity : Activity() {
                         entry.textContent || ''
                     );
                     name = name.replace(/\(\s*[−-]?\d+\s*\|\s*[−-]?\d+\s*\)/g, '').trim();
+                    if (!validName(name)) continue;
                     if (!name) name = 'Village ' + id;
                     seen.add(id);
                     out.push({ id, name, href:villageLink, tag:anchor?.tagName || entry.tagName || '',
@@ -1222,6 +1230,7 @@ class MainActivity : Activity() {
                         anchor.textContent || ''
                     );
                     name = name.replace(/\(\s*[−-]?\d+\s*\|\s*[−-]?\d+\s*\)/g, '').trim();
+                    if (!validName(name)) continue;
                     if (!name) name = 'Village ' + id;
                     seen.add(id);
                     out.push({id, name, href:villageLink, tag:anchor.tagName || '', idAttr:anchor.id || '',
@@ -1261,16 +1270,16 @@ class MainActivity : Activity() {
                 val item = array.optJSONObject(i) ?: continue
                 val id = item.optString("id").trim()
                 val name = item.optString("name").trim().ifBlank { "Village $id" }
+                val normalizedName = name.lowercase(Locale.ROOT).replace(Regex("\\s+"), " ").trim()
+                val invalidNames = setOf("attack", "defender", "crop", "village groups", "villages", "new village group")
+                if (normalizedName in invalidNames || normalizedName.startsWith("attack ") || normalizedName.startsWith("defender ") || normalizedName.startsWith("crop ")) continue
                 val href = item.optString("href").trim()
-                if (id.isNotBlank()) {
+                if (id.isNotBlank() && id.toLongOrNull() != null) {
                     val canonicalLink = "${normalizeServer(serverInput.text.toString())}/dorf1.php?newdid=$id"
                     targets.add(id to name)
                     villageScanCollectedLinks[id] = canonicalLink
-                    upsertVillageDataRecord(
-                        id = id,
-                        namaVillage = name,
-                        linkVillage = canonicalLink
-                    )
+                    // Jangan commit record hanya karena target ditemukan. Record baru
+                    // disimpan setelah detail village berhasil dibaca seluruhnya.
                 }
             }
         }
@@ -1943,6 +1952,9 @@ class MainActivity : Activity() {
     private fun finishVillageScan() {
         debugTrace("ENTER finishVillageScan")
         villageScanActive = false
+        villageScanCommitReady = villageScanExpected <= 0 ||
+            (villageScanResults.distinctBy { it.first }.size >= villageScanTargets.distinctBy { it.first }.size &&
+                villageScanTargets.distinctBy { it.first }.size >= villageScanExpected)
 
         // Semua target tetap masuk ke checklist. Jika pembacaan detail satu village
         // gagal, namanya tetap ditampilkan dan level akan memakai data lama bila ada.
@@ -1956,11 +1968,17 @@ class MainActivity : Activity() {
 
         renderVillageChecklist(merged)
 
-        // Buang record village lama yang sudah tidak ada pada hasil refresh terbaru.
-        val currentIds = merged.map { it.first }.toSet()
-        val currentRecords = loadVillageDataRecords()
-        if (currentRecords.isNotEmpty()) {
-            saveVillageDataRecords(currentRecords.filter { currentIds.contains(it.id) })
+        // Commit database hanya jika seluruh target berhasil diproses.
+        // Refresh parsial tidak boleh menghapus data lama atau membuat DB setengah jadi.
+        if (villageScanCommitReady) {
+            val currentIds = merged.map { it.first }.toSet()
+            val currentRecords = loadVillageDataRecords()
+            if (currentRecords.isNotEmpty()) {
+                saveVillageDataRecords(currentRecords.filter { currentIds.contains(it.id) })
+            }
+            logEvent("REFRESH VILLAGE COMMIT: lengkap ${processedCount}/${merged.size}")
+        } else {
+            logEvent("REFRESH VILLAGE INCOMPLETE: database lama dipertahankan; detail ${processedCount}/${merged.size}")
         }
         villageScanTargets.clear()
     }
